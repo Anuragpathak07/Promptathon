@@ -1,0 +1,41 @@
+# ============================================================
+# MVTec-AD Anomaly Detection — Project Configuration
+# ============================================================
+
+dataset:
+  hub_name: "Voxel51/mvtec-ad"
+  categories:
+    - metal_nut
+    - transistor
+    - capsule
+    - cable
+    - pill
+  image_size: 224
+  data_dir: "./data/mvtec"
+
+model:
+  backbone: "resnet50"          # Feature extractor backbone
+  pretrained: true              # Use ImageNet pretrained weights
+  layers:
+    - "layer2"
+    - "layer3"
+  patch_size: 3                 # PatchCore patch neighbourhood size
+  num_neighbors: 9              # k for k-NN search in coreset
+  coreset_sampling_ratio: 0.25  # Fraction of patches kept in memory bank
+  faiss_on_gpu: false
+
+training:
+  seed: 42
+  batch_size: 32
+  num_workers: 4
+  output_dir: "./outputs/models"
+
+evaluation:
+  threshold_percentile: 99     # Anomaly score threshold (percentile of train scores)
+  output_dir: "./outputs/results"
+
+demo:
+  port: 7860
+  share: false
+  heatmap_alpha: 0.5
+  colormap: "jet"

@@ -1,0 +1,33 @@
+# Core ML & Vision
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0
+
+# Dataset Loading
+fiftyone>=0.23.0
+huggingface-hub>=0.20.0
+datasets>=2.16.0
+
+# Anomaly Detection
+scikit-learn>=1.3.0
+scipy>=1.11.0
+faiss-cpu>=1.7.4
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Demo UI
+gradio>=4.20.0
+
+# Metrics & Evaluation
+scikit-learn>=1.3.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+pandas>=2.0.0
+joblib>=1.3.0
