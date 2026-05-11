@@ -68,19 +68,48 @@ class MVTecDataset(Dataset):
         self.split      = split
         self.image_size = image_size
 
-        root = Path(data_dir) / category / split
-        if not root.exists():
-            raise FileNotFoundError(
-                f"Data directory not found: {root}\n"
-                "Run data_loader.py first to download and export the dataset."
-            )
+        root = Path(data_dir) / category
+        csv_path = root / "image_anno.csv"
 
         self.samples: List[Tuple[Path, int]] = []  # (path, label)
-        for defect_dir in sorted(root.iterdir()):
-            label = 0 if defect_dir.name == "good" else 1
-            for img_path in sorted(defect_dir.glob("*.*")):
-                if img_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
-                    self.samples.append((img_path, label))
+
+        if csv_path.exists():
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            
+            # Split normal images deterministically: first 80% train, remaining 20% test
+            normal_df = df[df['label'] == 'normal'].copy()
+            anomaly_df = df[df['label'] != 'normal'].copy()
+            
+            num_normal = len(normal_df)
+            split_idx = int(num_normal * 0.8)
+            
+            if split == "train":
+                selected_normal = normal_df.iloc[:split_idx]
+                for _, row in selected_normal.iterrows():
+                    img_path = Path(data_dir) / row['image']
+                    self.samples.append((img_path, 0))
+            else:  # test
+                selected_normal = normal_df.iloc[split_idx:]
+                for _, row in selected_normal.iterrows():
+                    img_path = Path(data_dir) / row['image']
+                    self.samples.append((img_path, 0))
+                for _, row in anomaly_df.iterrows():
+                    img_path = Path(data_dir) / row['image']
+                    self.samples.append((img_path, 1))
+        else:
+            root_split = root / split
+            if not root_split.exists():
+                raise FileNotFoundError(
+                    f"Data directory not found: {root_split}\n"
+                    "Run data_loader.py first to download and export the dataset."
+                )
+
+            for defect_dir in sorted(root_split.iterdir()):
+                label = 0 if defect_dir.name == "good" else 1
+                for img_path in sorted(defect_dir.glob("*.*")):
+                    if img_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+                        self.samples.append((img_path, label))
 
         if not self.samples:
             raise RuntimeError(f"No images found under {root}")
@@ -306,7 +335,10 @@ class PatchCore:
         calib_loader = DataLoader(
             train_ds, batch_size=1, num_workers=0, shuffle=False
         )
-        for img_tensor, _, _ in tqdm(calib_loader, desc="  Calibrating"):
+        max_calib = 150
+        for idx, (img_tensor, _, _) in enumerate(tqdm(calib_loader, desc="  Calibrating")):
+            if idx >= max_calib:
+                break
             score, _ = self.predict_image(img_tensor)
             per_image_scores.append(score)
 
@@ -404,7 +436,7 @@ class PatchCore:
         with open(pkl_path, "rb") as f:
             payload = pickle.load(f)
         self.memory_bank = payload["memory_bank"]
-        self.threshold   = payload["threshold"]
+        self.threshold   = payload["threshold"] * 1.15  # Increased global threshold by 15% to prevent false alarms
         self.index       = faiss.read_index(str(index_path))
         log.info(f"[{self.category}] Loaded model from {self.output_dir}")
 

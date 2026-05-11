@@ -10,6 +10,10 @@ dataset:
     - capsule
     - cable
     - pill
+    - pcb1
+    - pcb2
+    - pcb3
+    - pcb4
   image_size: 224
   data_dir: "./data/mvtec"
 
