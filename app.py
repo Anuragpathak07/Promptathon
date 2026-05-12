@@ -31,6 +31,7 @@ import yaml
 from PIL import Image
 
 from model import build_patchcore, PatchCore
+import spec_analyzer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -179,6 +180,13 @@ def run_inference(
 
     # Preprocess
     img_pil   = image.convert("RGB")
+    segment_enabled = (
+        CFG["dataset"].get("segmentation", {}).get("enabled", False)
+        and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
+    )
+    if segment_enabled:
+        from model import apply_otsu_mask
+        img_pil = apply_otsu_mask(img_pil)
     img_tensor = TRANSFORM(img_pil).unsqueeze(0)  # (1, 3, H, W)
 
     # Inference
@@ -235,6 +243,59 @@ def run_inference(
     return overlay, score_bar, verdict_html, metrics_text
 
 
+def run_spec_analysis(
+    image: Optional[Image.Image],
+    category: str,
+) -> str:
+    """
+    In-memory prediction mapping and spec sheet query via Groq.
+    """
+    if image is None:
+        return "<p style='color:#ff4d6d'>Please upload an image first.</p>"
+
+    if category not in MODELS:
+        return f"<p style='color:#ff4d6d'>No trained model for {category}. Run train.py first.</p>"
+
+    # 1. Run local PatchCore inference in-memory
+    pc = MODELS[category]
+    img_pil = image.convert("RGB")
+    segment_enabled = (
+        CFG["dataset"].get("segmentation", {}).get("enabled", False)
+        and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
+    )
+    if segment_enabled:
+        from model import apply_otsu_mask
+        img_pil = apply_otsu_mask(img_pil)
+    img_tensor = TRANSFORM(img_pil).unsqueeze(0)
+    anomaly_score, _ = pc.predict_image(img_tensor)
+    threshold = pc.threshold
+    is_anomaly = anomaly_score >= threshold
+    verdict = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
+
+    # 2. Query Groq Spec Analyzer
+    report = spec_analyzer.analyze_with_spec(img_pil, category, anomaly_score, verdict)
+
+    # 3. Formulate beautiful visual risk badge
+    risk, color = spec_analyzer.get_risk_level(report)
+    risk_badge = f"""
+    <div style="background: rgba(255,255,255,0.02); border-left: 5px solid {color}; padding: 14px 18px; border-radius: 8px; margin-bottom: 18px; font-family: Inter, sans-serif;">
+        <div style="color: {color}; font-weight: 800; font-size: 1.25rem; letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px;">
+            ⚠️ AI RISK ASSESSMENT: {risk}
+        </div>
+        <div style="color: #a0a0c0; font-size: 0.9rem; margin-top: 4px;">
+            Based on direct datasheet specification comparison
+        </div>
+    </div>
+    """
+
+    return f"{risk_badge}\n\n{report}"
+
+
+def reset_spec_report() -> str:
+    """Reset the spec report text block in Gradio"""
+    return "*Analysis report will appear here... Click the button above to run.*"
+
+
 # ================================================================== #
 #  Gradio UI                                                           #
 # ================================================================== #
@@ -266,6 +327,21 @@ body, .gradio-container {
 .gr-button-primary:hover {
     transform: translateY(-2px) !important;
     box-shadow: 0 8px 24px rgba(124,106,247,0.4) !important;
+}
+
+#spec_btn {
+    background: linear-gradient(135deg, #2a2b4c, #3f2d54) !important;
+    border: 1px solid rgba(124,106,247,0.4) !important;
+    color: #e0e0f0 !important;
+    font-weight: 600 !important;
+    border-radius: 8px !important;
+    transition: all 0.3s ease !important;
+}
+
+#spec_btn:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 24px rgba(124,106,247,0.2) !important;
+    background: linear-gradient(135deg, #32335c, #4c3666) !important;
 }
 
 h1, h2, h3 { color: #e0e0f0 !important; }
@@ -365,6 +441,21 @@ def build_demo() -> gr.Blocks:
                     interactive=False,
                 )
 
+                gr.HTML("<hr style='border-color: rgba(124,106,247,0.2); margin: 20px 0;'>")
+                gr.Markdown("### 📋 AI Datasheet & Spec Analysis")
+                gr.Markdown("Compare the physical image against the manufacturer's official specifications using Groq.")
+
+                spec_btn = gr.Button(
+                    "🔍 Run AI Specification Analysis",
+                    variant="secondary",
+                    elem_id="spec_btn",
+                )
+
+                spec_report_out = gr.Markdown(
+                    value="*Analysis report will appear here... Click the button above to run.*",
+                    elem_id="spec_report"
+                )
+
         # ── Examples ─────────────────────────────────────────────────
         example_dir = Path("./sample_images")
         if example_dir.exists():
@@ -382,6 +473,18 @@ def build_demo() -> gr.Blocks:
             fn=run_inference,
             inputs=[input_img, category_dd],
             outputs=[heatmap_out, score_bar_out, verdict_html, metrics_box],
+        )
+
+        detect_btn.click(
+            fn=reset_spec_report,
+            inputs=[],
+            outputs=[spec_report_out],
+        )
+
+        spec_btn.click(
+            fn=run_spec_analysis,
+            inputs=[input_img, category_dd],
+            outputs=[spec_report_out],
         )
 
         gr.Markdown(

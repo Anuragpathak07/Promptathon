@@ -16,6 +16,17 @@ dataset:
     - pcb4
   image_size: 224
   data_dir: "./data/mvtec"
+  segmentation:
+    enabled: true
+    method: "otsu"
+    categories:
+      - pcb1
+      - pcb2
+      - pcb3
+      - pcb4
+      - metal_nut
+      - capsule
+      - pill
 
 model:
   backbone: "resnet50"          # Feature extractor backbone

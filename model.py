@@ -43,6 +43,47 @@ log.info(f"Using device: {DEVICE}")
 
 
 # ================================================================== #
+#  Segmentation / Masking Helpers                                      #
+# ================================================================== #
+import cv2
+
+def apply_otsu_mask(img_pil: Image.Image) -> Image.Image:
+    """
+    Generate an Otsu threshold-based foreground mask, find the largest
+    contour (e.g. PCB/component), fill it to eliminate any internal holes,
+    dilate it slightly, and black out the background.
+    """
+    img_np = np.array(img_pil.convert("RGB"))
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    
+    # Otsu's binarisation thresholding
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Auto-detect if background is lighter than foreground (invert mask if needed)
+    h, w = mask.shape
+    corner_pixels = [mask[0, 0], mask[0, w-1], mask[h-1, 0], mask[h-1, w-1]]
+    if sum(corner_pixels) > 510:  # More than half of corners are white
+        mask = cv2.bitwise_not(mask)
+        
+    # Find contours and extract the largest one (e.g. main board or object)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        # Create a new blank mask and draw the filled largest contour
+        filled_mask = np.zeros_like(mask)
+        cv2.drawContours(filled_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+        
+        # Dilate mask slightly to prevent aggressive border truncation
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        filled_mask = cv2.dilate(filled_mask, kernel, iterations=1)
+        mask = filled_mask
+
+    # Mask original image
+    masked_np = cv2.bitwise_and(img_np, img_np, mask=mask)
+    return Image.fromarray(masked_np)
+
+
+# ================================================================== #
 #  Dataset                                                            #
 # ================================================================== #
 class MVTecDataset(Dataset):
@@ -67,6 +108,13 @@ class MVTecDataset(Dataset):
     ):
         self.split      = split
         self.image_size = image_size
+        self.category   = category
+
+        # Check if segmentation is enabled for this category
+        self.segment_enabled = (
+            CFG["dataset"].get("segmentation", {}).get("enabled", False)
+            and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
+        )
 
         root = Path(data_dir) / category
         csv_path = root / "image_anno.csv"
@@ -126,6 +174,8 @@ class MVTecDataset(Dataset):
     def __getitem__(self, idx: int):
         path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
+        if self.segment_enabled:
+            img = apply_otsu_mask(img)
         return self.transform(img), label, str(path)
 
 
@@ -436,6 +486,7 @@ class PatchCore:
         with open(pkl_path, "rb") as f:
             payload = pickle.load(f)
         self.memory_bank = payload["memory_bank"]
+        
         self.threshold   = payload["threshold"] * 1.15  # Increased global threshold by 15% to prevent false alarms
         self.index       = faiss.read_index(str(index_path))
         log.info(f"[{self.category}] Loaded model from {self.output_dir}")
