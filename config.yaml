@@ -20,10 +20,6 @@ dataset:
     enabled: true
     method: "otsu"
     categories:
-      - pcb1
-      - pcb2
-      - pcb3
-      - pcb4
       - metal_nut
       - capsule
       - pill
@@ -36,7 +32,7 @@ model:
     - "layer3"
   patch_size: 3                 # PatchCore patch neighbourhood size
   num_neighbors: 9              # k for k-NN search in coreset
-  coreset_sampling_ratio: 0.25  # Fraction of patches kept in memory bank
+  coreset_sampling_ratio: 0.05  # Fraction of patches kept in memory bank
   faiss_on_gpu: false
 
 training:

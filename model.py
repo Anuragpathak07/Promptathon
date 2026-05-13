@@ -487,7 +487,7 @@ class PatchCore:
             payload = pickle.load(f)
         self.memory_bank = payload["memory_bank"]
         
-        self.threshold   = payload["threshold"] * 1.15  # Increased global threshold by 15% to prevent false alarms
+        self.threshold   = payload["threshold"]  # Increased global threshold by 15% to prevent false alarms
         self.index       = faiss.read_index(str(index_path))
         log.info(f"[{self.category}] Loaded model from {self.output_dir}")
 

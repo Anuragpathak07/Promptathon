@@ -1,165 +1,246 @@
-# spec_analyzer.py
+"""
+spec_analyzer.py
+----------------
+Calls the AI (Groq / OpenAI-compatible) to produce an inspection report
+comparing the uploaded component image against its datasheet specification.
 
-import os
-import base64
-import httpx
-import io
-import pypdf
-from PIL import Image
-from groq import Groq
-
-# ---- Direct PDF URLs for all 4 PCBs ----
-DATASHEET_URLS = {
-    "pcb1": "https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf",
-    "pcb2": "https://www.handsontec.com/dataspecs/HC-SR04-Ultrasonic.pdf",
-    "pcb3": "https://www.vishay.com/docs/83760/tcrt5000.pdf",
-    "pcb4": "https://dlnmh9ip6v2uc.cloudfront.net/datasheets/Prototyping/TP4056.pdf"
-}
-
-def extract_pdf_text_from_url(url):
-    """Download PDF from URL and extract text using pypdf"""
-    try:
-        response = httpx.get(url, timeout=30.0)
-        response.raise_for_status()
-        pdf_file = io.BytesIO(response.content)
-        reader = pypdf.PdfReader(pdf_file)
-        text = ""
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                text += f"--- Page {i+1} ---\n{page_text}\n"
-        return text
-    except Exception as e:
-        return f"Error downloading or extracting PDF datasheet from {url}: {str(e)}"
-
-def encode_image(image):
-    """Convert PIL image to base64 for Groq API"""
-    buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-def analyze_with_spec(image, category, anomaly_score, verdict):
-    """
-    Sends PCB image + extracted datasheet text to Groq
-    Groq reads the actual spec and compares against the image
-    """
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return (
-            "Error: GROQ_API_KEY environment variable is not set. "
-            "Please configure your Groq API key in your environment to use this feature."
-        )
-
-    # Fetch the actual datasheet URL
-    pdf_url = DATASHEET_URLS.get(category)
-    if not pdf_url:
-        return f"No official datasheet mapping found for category: '{category}'. Only pcb1, pcb2, pcb3, and pcb4 are supported."
-
-    # Extract the text content from the PDF datasheet
-    pdf_text = extract_pdf_text_from_url(pdf_url)
-    if "Error downloading" in pdf_text:
-        return pdf_text
-
-    # Encode the PCB image
-    try:
-        image_data = encode_image(image)
-    except Exception as e:
-        return f"Error encoding PCB image: {str(e)}"
-
-    # Initialize Groq client
-    try:
-        client = Groq(api_key=api_key)
-    except Exception as e:
-        return f"Error initializing Groq client: {str(e)}"
-
-    # Prompt
-    prompt = f"""
-    You are an expert PCB quality control engineer.
-
-    I am giving you two things:
-    1. The official manufacturing datasheet text for this component
-    2. An actual photo of this component from our production line
-
-    The automated vision system reported:
-    - Anomaly Score: {anomaly_score:.4f}
-    - Verdict: {verdict}
-    - Category: {category}
-
-    Please read the datasheet carefully and then inspect the image.
-    Give me:
-
-    1. CURRENT STATUS:
-       What do you physically see in the image?
-       Any visible issues even minor ones?
-
-    2. SPEC COMPLIANCE:
-       Based on the datasheet you just read,
-       does this component meet its specifications?
-       Call out any specific measurements, tolerances,
-       or visual requirements from the datasheet
-       that this component may be violating or borderline on.
-
-    3. RISK LEVEL: Pick one — LOW / MEDIUM / HIGH
-       LOW = Perfectly fine, ship it
-       MEDIUM = Looks okay now but has warning signs
-       HIGH = Will likely fail, do not ship
-
-    4. PREDICTED FAILURE:
-       If shipped today, what will fail, why, and roughly when?
-       Base this on the datasheet specs.
-
-    5. RECOMMENDATION:
-       What should the QC engineer do right now?
-
-    Be specific. Reference actual values from the datasheet.
-    Do not be vague.
-    """
-
-    # We append the PDF text directly to the system/user text message context
-    full_text = f"""
-Official manufacturing specification document for {category} component:
-========================================================================
-{pdf_text}
-========================================================================
-
-{prompt}
+IMPORTANT — The system prompt explicitly forbids markdown syntax so that
+the HTML renderer in app.py receives clean plain text with no ## / ** / ` artifacts.
 """
 
+import base64
+import io
+import logging
+import os
+import re
+from typing import Tuple
+from dotenv import load_dotenv
+from PIL import Image
+# Load variables from .env
+load_dotenv()
+log = logging.getLogger(__name__)
+
+# ── Client setup ─────────────────────────────────────────────────────────────
+# Supports Groq (default) or any OpenAI-compatible endpoint.
+# Set GROQ_API_KEY (or OPENAI_API_KEY) in your environment.
+
+def _get_client():
+    """Lazy-import and return an OpenAI-compatible client."""
     try:
-        # Send text and image to Groq's multimodal Llama 4 Vision model
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            max_tokens=1500,
-            temperature=0.2,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": full_text
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_data}"
-                            }
-                        }
-                    ]
-                }
-            ]
+        from groq import Groq
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if api_key:
+            return Groq(api_key=api_key), "groq"
+    except ImportError:
+        pass
+
+    try:
+        from openai import OpenAI
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if api_key:
+            return OpenAI(api_key=api_key), "openai"
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "No AI client available. Install 'groq' or 'openai' and set the API key."
+    )
+
+
+def _pil_to_b64(image: Image.Image, max_dim: int = 1024) -> str:
+    """Resize and base64-encode a PIL image as JPEG."""
+    img = image.copy()
+    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ── System prompt — NO markdown ───────────────────────────────────────────────
+SYSTEM_PROMPT = """You are an expert industrial quality-control engineer with deep knowledge of
+electronic components, PCB assemblies, and manufacturer datasheets.
+
+Your task is to inspect a component image and produce a structured inspection report.
+
+STRICT FORMATTING RULES — follow these exactly or the report will be unreadable:
+1. Do NOT use any markdown syntax whatsoever.
+   - No hash characters (#) for headings.
+   - No asterisks (*) for bold or italic.
+   - No backticks (`) for code.
+   - No underscores (_) for formatting.
+   - No triple-dashes (---) for horizontal rules.
+2. Structure your report using ONLY plain-text numbered sections, like:
+     1. CURRENT STATUS:
+     2. SPEC COMPLIANCE:
+     3. RISK LEVEL:
+     4. RECOMMENDATIONS:
+3. Use plain dashes for bullet points, like:
+     - Item one description here
+     - Item two description here
+4. For emphasis, write in ALL CAPS instead of using asterisks.
+5. Numbers, measurements, and specs should be written plainly, e.g.: 45mm x 20mm x 15mm.
+
+The report should be factual, concise, and based on what is visually observable in the image
+combined with the known datasheet specifications for the identified component category."""
+
+
+def analyze_with_spec(
+    image: Image.Image,
+    category: str,
+    anomaly_score: float,
+    verdict: str,
+) -> str:
+    """
+    Send the component image + PatchCore verdict to the AI and return a
+    plain-text inspection report (no markdown syntax).
+
+    Parameters
+    ----------
+    image         : PIL image of the component under inspection
+    category      : MVTec-AD category string (e.g. 'transistor', 'bottle')
+    anomaly_score : Float score from PatchCore
+    verdict       : 'NORMAL' or 'ANOMALY (DEFECTIVE)'
+
+    Returns
+    -------
+    Plain-text report string.
+    """
+    client, backend = _get_client()
+    b64_image = _pil_to_b64(image)
+
+    user_prompt = (
+        f"Component category: {category}\n"
+        f"PatchCore anomaly score: {anomaly_score:.6f}\n"
+        f"PatchCore verdict: {verdict}\n\n"
+        "Please inspect the attached component image and produce a full inspection report "
+        "following the formatting rules in your system instructions. "
+        "Include:\n"
+        "1. CURRENT STATUS — describe what you see in the image (markings, physical condition, "
+        "visible features, any defects).\n"
+        "2. SPEC COMPLIANCE — list key datasheet specifications and whether the component "
+        "appears to comply with each one based on visual inspection.\n"
+        "3. RISK LEVEL — state LOW, MEDIUM, HIGH, or CRITICAL with a one-sentence justification.\n"
+        "4. RECOMMENDATIONS — list any actions the engineer should take.\n\n"
+        "Remember: plain text only, no markdown symbols."
+    )
+
+    try:
+        if backend == "groq":
+            # Groq vision model
+            response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_image}"
+                                },
+                            },
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    },
+                ],
+                max_tokens=1024,
+                temperature=0.2,
+            )
+        else:
+            # OpenAI GPT-4o
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_image}",
+                                    "detail": "high",
+                                },
+                            },
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    },
+                ],
+                max_tokens=1024,
+                temperature=0.2,
+            )
+
+        report = response.choices[0].message.content.strip()
+
+        # ── Safety net: strip any residual markdown that the model ignored ──
+        report = _strip_residual_markdown(report)
+        return report
+
+    except Exception as exc:
+        log.error(f"AI spec analysis failed: {exc}")
+        return (
+            f"1. CURRENT STATUS:\n"
+            f"- AI analysis unavailable: {exc}\n\n"
+            f"2. SPEC COMPLIANCE:\n"
+            f"- Unable to perform automated datasheet comparison.\n\n"
+            f"3. RISK LEVEL:\n"
+            f"UNKNOWN — manual inspection required.\n\n"
+            f"4. RECOMMENDATIONS:\n"
+            f"- Check API key and network connectivity.\n"
+            f"- Perform manual visual inspection against the component datasheet."
         )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error executing Groq API call: {str(e)}"
 
 
-def get_risk_level(analysis_text):
-    """Extract risk level from Groq response"""
-    text_upper = analysis_text.upper()
-    if "HIGH" in text_upper:
-        return "HIGH", "#ff4444"
-    elif "MEDIUM" in text_upper:
-        return "MEDIUM", "#ffaa00"
-    else:
-        return "LOW", "#44ff44"
+def _strip_residual_markdown(text: str) -> str:
+    """
+    Post-processing safety net.
+    Removes any markdown syntax the model included despite instructions.
+    Converts common patterns to plain-text equivalents.
+    """
+    lines = text.splitlines()
+    clean = []
+    for line in lines:
+        # ## Heading → plain uppercase text
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        # **bold** or __bold__ → UPPERCASE the content
+        line = re.sub(r"\*\*(.+?)\*\*", lambda m: m.group(1).upper(), line)
+        line = re.sub(r"__(.+?)__",     lambda m: m.group(1).upper(), line)
+        # *italic* or _italic_ → plain
+        line = re.sub(r"\*(.+?)\*", r"\1", line)
+        line = re.sub(r"_(.+?)_",   r"\1", line)
+        # `code` → plain
+        line = re.sub(r"`(.+?)`", r"\1", line)
+        # Horizontal rules
+        line = re.sub(r"^-{3,}$", "", line)
+        line = re.sub(r"^\*{3,}$", "", line)
+        clean.append(line)
+    return "\n".join(clean)
+
+
+def get_risk_level(report: str) -> Tuple[str, str]:
+    """
+    Parse the RISK LEVEL section from the plain-text report.
+    Returns (risk_label, justification).
+    """
+    # Look for "3. RISK LEVEL:" section or "RISK LEVEL:" anywhere
+    section_re = re.compile(
+        r"(?:3\.\s*)?RISK\s*LEVEL\s*[:\-]?\s*\n?(.*?)(?:\n\n|\n\d+\.|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = section_re.search(report)
+    if not m:
+        return "LOW", ""
+
+    content = m.group(1).strip()
+    first_line = content.splitlines()[0].strip() if content else ""
+
+    # Extract the risk word
+    for level in ("CRITICAL", "HIGH", "MEDIUM", "MODERATE", "LOW"):
+        if level in first_line.upper():
+            rest = re.sub(level, "", first_line, flags=re.IGNORECASE).strip(" -:—")
+            return level, rest
+
+    # Fall back: return first non-empty word
+    word = re.sub(r"[^A-Za-z]", "", first_line.split()[0]) if first_line.split() else "LOW"
+    return word.upper() or "LOW", first_line
