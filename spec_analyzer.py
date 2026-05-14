@@ -296,10 +296,12 @@ def analyze_zero_shot(image: Image.Image, category: str) -> dict:
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "Coordinates rule for 'box_2d':\n"
-        "- They must be normalized values between 0 and 100 representing percentage of height/width.\n"
+        "CRITICAL Coordinates rule for 'box_2d':\n"
+        "- They must be normalized percentage values between 0 and 100 representing percentage of height/width.\n"
         "- [ymin, xmin, ymax, xmax] where 0 is top/left and 100 is bottom/right.\n"
-        "- If no anomalies/defects are detected, the 'defects' list MUST be empty [].\n\n"
+        "- You MUST tightly wrap ONLY the exact physical defect region. Do not include surrounding normal board surface or empty background.\n"
+        "- Do NOT report false anomalies for normal asymmetrical component contours or mounting holes.\n"
+        "- If no genuine defects are detected, the 'defects' list MUST be empty [].\n\n"
         "Ensure your output is a single valid JSON block."
     )
 

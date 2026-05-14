@@ -626,6 +626,10 @@ def draw_llm_overlay(image: Image.Image, defects: list) -> Image.Image:
             ymax = int(ymax * h / 100)
             xmax = int(xmax * w / 100)
 
+            # Sanity check: discard invalid boxes or massive false-positive boxes covering > 75% of image area
+            if xmax <= xmin or ymax <= ymin or (xmax - xmin) * (ymax - ymin) > 0.75 * h * w:
+                continue
+
             # Clip coordinates to image boundary
             ymin, xmin = max(0, ymin), max(0, xmin)
             ymax, xmax = min(h, ymax), min(w, xmax)
@@ -669,8 +673,10 @@ def run_inference(
 
     if category not in MODELS:
         # Zero-shot AI Fallback Mode
+        from model import apply_rembg_mask
         img_pil = image.convert("RGB")
-        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+        img_masked = apply_rembg_mask(img_pil)
+        res = spec_analyzer.analyze_zero_shot(img_masked, category)
 
         is_anomaly = res["is_anomaly"]
         anomaly_score = res["anomaly_score"]
@@ -877,7 +883,9 @@ def run_spec_analysis(
     img_pil = image.convert("RGB")
     if category not in MODELS:
         # Fallback to zero-shot
-        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+        from model import apply_rembg_mask
+        img_masked = apply_rembg_mask(img_pil)
+        res = spec_analyzer.analyze_zero_shot(img_masked, category)
         anomaly_score = res["anomaly_score"]
         is_anomaly = res["is_anomaly"]
         threshold = 0.5
@@ -1001,7 +1009,9 @@ def generate_pdf_report(
     img_pil = image.convert("RGB")
     if category not in MODELS:
         # Fallback to zero-shot
-        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+        from model import apply_rembg_mask
+        img_masked = apply_rembg_mask(img_pil)
+        res = spec_analyzer.analyze_zero_shot(img_masked, category)
         anomaly_score = res["anomaly_score"]
         is_anomaly = res["is_anomaly"]
         threshold = 0.5
