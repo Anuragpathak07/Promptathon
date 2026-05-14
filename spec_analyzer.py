@@ -9,6 +9,7 @@ the HTML renderer in app.py receives clean plain text with no ## / ** / ` artifa
 """
 
 import base64
+import json
 import io
 import logging
 import os
@@ -137,7 +138,7 @@ def analyze_with_spec(
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64_image}"
+                                     "url": f"data:image/jpeg;base64,{b64_image}"
                                 },
                             },
                             {"type": "text", "text": user_prompt},
@@ -146,6 +147,7 @@ def analyze_with_spec(
                 ],
                 max_tokens=1024,
                 temperature=0.2,
+                timeout=25.0,
             )
         else:
             # OpenAI GPT-4o
@@ -169,6 +171,7 @@ def analyze_with_spec(
                 ],
                 max_tokens=1024,
                 temperature=0.2,
+                timeout=25.0,
             )
 
         report = response.choices[0].message.content.strip()
@@ -223,9 +226,8 @@ def get_risk_level(report: str) -> Tuple[str, str]:
     Parse the RISK LEVEL section from the plain-text report.
     Returns (risk_label, justification).
     """
-    # Look for "3. RISK LEVEL:" section or "RISK LEVEL:" anywhere
     section_re = re.compile(
-        r"(?:3\.\s*)?RISK\s*LEVEL\s*[:\-]?\s*\n?(.*?)(?:\n\n|\n\d+\.|\Z)",
+        r"(?:(?:0?3|\d)\.?\s*)?RISK\s*LEVEL\s*[:\-]?\s*\n*(.*?)(?:\n\n|\n(?:0?4|\d+)\b|\Z)",
         re.IGNORECASE | re.DOTALL,
     )
     m = section_re.search(report)
@@ -235,12 +237,146 @@ def get_risk_level(report: str) -> Tuple[str, str]:
     content = m.group(1).strip()
     first_line = content.splitlines()[0].strip() if content else ""
 
-    # Extract the risk word
+    # Check the prefix before any dash or colon
+    prefix = re.split(r"[\-\:\—]", first_line)[0].strip().upper()
+
     for level in ("CRITICAL", "HIGH", "MEDIUM", "MODERATE", "LOW"):
-        if level in first_line.upper():
-            rest = re.sub(level, "", first_line, flags=re.IGNORECASE).strip(" -:—")
+        if level in prefix or first_line.upper().startswith(level):
+            rest = re.sub(f"^{level}", "", first_line, flags=re.IGNORECASE).strip(" -:—")
             return level, rest
 
-    # Fall back: return first non-empty word
     word = re.sub(r"[^A-Za-z]", "", first_line.split()[0]) if first_line.split() else "LOW"
     return word.upper() or "LOW", first_line
+
+
+
+def analyze_zero_shot(image: Image.Image, category: str) -> dict:
+    """
+    Perform zero-shot anomaly detection on the component image using an LMM.
+    Returns a dict containing:
+      - is_anomaly (bool)
+      - anomaly_score (float, 0.0 - 1.0)
+      - verdict_reason (str)
+      - defects (list of dicts, each with 'label' and 'box_2d' [ymin, xmin, ymax, xmax])
+    """
+    try:
+        client, backend = _get_client()
+    except Exception as e:
+        log.error(f"Failed to get AI client for zero-shot: {e}")
+        return {
+            "is_anomaly": False,
+            "anomaly_score": 0.0,
+            "verdict_reason": f"AI client unavailable: {e}",
+            "defects": []
+        }
+
+    b64_image = _pil_to_b64(image)
+
+    system_prompt = (
+        "You are an expert industrial quality-control vision AI system.\n"
+        "Your task is to inspect the provided image of a component and determine "
+        "if there are any physical anomalies, manufacturing defects, surface damages, "
+        "missing subcomponents, or alignment issues."
+    )
+
+    user_prompt = (
+        f"Component under inspection: {category}\n\n"
+        "Please analyze the provided image and respond ONLY with a valid JSON object. "
+        "Do NOT include any markdown formatting, code block ticks (```), explanations, "
+        "or text outside the JSON block.\n\n"
+        "JSON Schema:\n"
+        "{\n"
+        "  \"is_anomaly\": <true if there is any visible defect/anomaly, false otherwise>,\n"
+        "  \"anomaly_score\": <float between 0.0 and 1.0 representing the likelihood/severity of the anomaly>,\n"
+        "  \"verdict_reason\": \"<A concise description of the inspection result, describing the defect if found or confirming that everything is perfect>\",\n"
+        "  \"defects\": [\n"
+        "    {\n"
+        "      \"label\": \"<short name of the defect, e.g., 'scratched surface', 'burnt trace', 'missing pin'>\",\n"
+        "      \"box_2d\": [ymin, xmin, ymax, xmax]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Coordinates rule for 'box_2d':\n"
+        "- They must be normalized values between 0 and 100 representing percentage of height/width.\n"
+        "- [ymin, xmin, ymax, xmax] where 0 is top/left and 100 is bottom/right.\n"
+        "- If no anomalies/defects are detected, the 'defects' list MUST be empty [].\n\n"
+        "Ensure your output is a single valid JSON block."
+    )
+
+    try:
+        if backend == "groq":
+            # Groq Vision Model
+            response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_image}"
+                                },
+                            },
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    },
+                ],
+                max_tokens=512,
+                temperature=0.1,
+                timeout=25.0,
+            )
+        else:
+            # OpenAI GPT-4o
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_image}",
+                                    "detail": "high"
+                                },
+                            },
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    },
+                ],
+                max_tokens=512,
+                temperature=0.1,
+                timeout=25.0,
+            )
+
+        content = response.choices[0].message.content.strip()
+
+        # Parse JSON from content (find first `{` and last `}`)
+        json_match = re.search(r"(\{.*\})", content, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                return {
+                    "is_anomaly": bool(data.get("is_anomaly", False)),
+                    "anomaly_score": float(data.get("anomaly_score", 0.0)),
+                    "verdict_reason": str(data.get("verdict_reason", "No details provided.")),
+                    "defects": list(data.get("defects", []))
+                }
+            except Exception as parse_err:
+                log.error(f"Failed to parse LLM JSON: {parse_err}. Content was: {content}")
+        else:
+            log.error(f"No JSON block found in LLM response: {content}")
+
+    except Exception as api_err:
+        log.error(f"Zero-shot LLM inspection failed: {api_err}")
+
+    # Safe fallback
+    return {
+        "is_anomaly": False,
+        "anomaly_score": 0.0,
+        "verdict_reason": "Zero-shot visual analysis failed or timed out.",
+        "defects": []
+    }

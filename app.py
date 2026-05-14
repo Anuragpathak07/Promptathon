@@ -607,24 +607,164 @@ def make_score_bar(
     return Image.open(buf).copy()
 
 
+def draw_llm_overlay(image: Image.Image, defects: list) -> Image.Image:
+    """
+    Draw beautiful premium bounding boxes on the original image for LMM detected defects.
+    Defects are dicts with 'label' and 'box_2d' [ymin, xmin, ymax, xmax] in normalized (0-100) coordinates.
+    """
+    img_np = np.array(image.convert("RGB"))
+    h, w, _ = img_np.shape
+    overlay = img_np.copy()
+
+    for d in defects:
+        box = d.get("box_2d", [])
+        if len(box) == 4:
+            # Normalized [ymin, xmin, ymax, xmax] in 0-100
+            ymin, xmin, ymax, xmax = box
+            ymin = int(ymin * h / 100)
+            xmin = int(xmin * w / 100)
+            ymax = int(ymax * h / 100)
+            xmax = int(xmax * w / 100)
+
+            # Clip coordinates to image boundary
+            ymin, xmin = max(0, ymin), max(0, xmin)
+            ymax, xmax = min(h, ymax), min(w, xmax)
+
+            # Draw semi-transparent filled rectangle for highlighting
+            cv2.rectangle(overlay, (xmin, ymin), (xmax, ymax), (232, 103, 74), -1) # Red fill
+
+            # Draw solid boundary border
+            cv2.rectangle(img_np, (xmin, ymin), (xmax, ymax), (232, 103, 74), 2)
+
+            # Draw tab label
+            label = d.get("label", "Defect").upper()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.45
+            thickness = 1
+            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+
+            # Label box sit slightly above the bounding box
+            lymin = max(text_size[1] + 10, ymin)
+            cv2.rectangle(img_np, (xmin, lymin - text_size[1] - 6), (xmin + text_size[0] + 6, lymin), (232, 103, 74), -1)
+            cv2.putText(img_np, label, (xmin + 3, lymin - 4), font, font_scale, (8, 13, 26), thickness, cv2.LINE_AA)
+
+    # Blend overlay with drawn solid borders
+    alpha = 0.22
+    blended = cv2.addWeighted(overlay, alpha, img_np, 1 - alpha, 0)
+    return Image.fromarray(blended)
+
+
 def run_inference(
     image: Optional[Image.Image],
     category: str,
+    custom_category: str = "",
 ) -> Tuple[Image.Image, Image.Image, str, str, str]:
     """Returns: overlay, score_bar, verdict_html, metrics_text, viz_panel_html"""
+    if category == "Other (Specify below...)" and custom_category:
+        category = custom_category.strip()
+
     if image is None:
         dummy = Image.new("RGB", (224, 224), "#0E1628")
         return dummy, dummy, "<p>Please upload an image.</p>", "", _build_viz_panel_empty()
 
     if category not in MODELS:
-        dummy = Image.new("RGB", (224, 224), "#0E1628")
-        return (
-            dummy, dummy,
-            f"<p style='color:#E8674A'>No trained model for '{category}'."
-            f" Run train.py first.</p>",
-            "",
-            _build_viz_panel_empty(),
+        # Zero-shot AI Fallback Mode
+        img_pil = image.convert("RGB")
+        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+
+        is_anomaly = res["is_anomaly"]
+        anomaly_score = res["anomaly_score"]
+        # LMM score is 0.0 - 1.0, so let's set threshold to 0.5
+        threshold = 0.5
+        verdict_reason = res["verdict_reason"]
+        defects = res["defects"]
+
+        # Construct synthetic score_map (28, 28)
+        score_map = np.random.uniform(0.05, 0.12, size=(28, 28))
+        if defects:
+            for d in defects:
+                box = d.get("box_2d", [])
+                if len(box) == 4:
+                    ymin, xmin, ymax, xmax = box
+                    y_start = int(ymin * 28 / 100)
+                    x_start = int(xmin * 28 / 100)
+                    y_end = int(ymax * 28 / 100)
+                    x_end = int(xmax * 28 / 100)
+
+                    y_start, x_start = max(0, y_start), max(0, x_start)
+                    y_end, x_end = min(28, y_end), min(28, x_end)
+
+                    if y_end > y_start and x_end > x_start:
+                        score_map[y_start:y_end, x_start:x_end] = np.random.uniform(0.7, 0.95, size=(y_end - y_start, x_end - x_start))
+        else:
+            if is_anomaly:
+                # If marked anomaly but no bounding boxes, light up MC (Mid-Center) region
+                score_map[9:19, 9:19] = np.random.uniform(0.7, 0.85, size=(10, 10))
+
+        # Push to history
+        _push_history(anomaly_score, threshold, is_anomaly, f"{category} (AI)")
+
+        # Draw overlay
+        if defects:
+            overlay = draw_llm_overlay(img_pil, defects)
+        else:
+            overlay = img_pil.copy()
+            if is_anomaly:
+                # Draw a generic border if is_anomaly but no boxes returned
+                img_np = np.array(overlay)
+                h, w, _ = img_np.shape
+                cv2.rectangle(img_np, (15, 15), (w-15, h-15), (232, 103, 74), 3)
+                overlay = Image.fromarray(img_np)
+
+        score_bar = make_score_bar(anomaly_score, threshold)
+
+        if is_anomaly:
+            verdict_html = f"""
+            <div style="background:#160C0A;border:1px solid #5C2318;border-left:3px solid #E8674A;
+                padding:18px 20px;border-radius:6px;font-family:'DM Sans',sans-serif;">
+              <div style="display:flex;align-items:center;gap:10px;font-size:1.1rem;font-weight:600;
+                  color:#E8674A;letter-spacing:0.04em;text-transform:uppercase;">
+                <span style="font-size:1.3rem">⚠</span> AI: Defect Detected
+              </div>
+              <div style="color:#C4907E;margin-top:8px;font-size:0.9rem;line-height:1.5">
+                {verdict_reason}
+              </div>
+              <div style="margin-top:8px;font-size:0.85rem;color:#D8E0F4;">
+                AI Score: <span style="font-family:'DM Mono',monospace;color:#E8A090;font-weight:600;">{anomaly_score:.2f}</span> (Threshold: 0.50)
+              </div>
+              <div style="margin-top:6px;font-size:0.72rem;color:#7A5A52;letter-spacing:0.06em;text-transform:uppercase;">
+                AI Zero-Shot Inspection · {category}
+              </div>
+            </div>"""
+        else:
+            verdict_html = f"""
+            <div style="background:#07160F;border:1px solid #13412D;border-left:3px solid #4ABFA8;
+                padding:18px 20px;border-radius:6px;font-family:'DM Sans',sans-serif;">
+              <div style="display:flex;align-items:center;gap:10px;font-size:1.1rem;font-weight:600;
+                  color:#4ABFA8;letter-spacing:0.04em;text-transform:uppercase;">
+                <span style="font-size:1.3rem">✓</span> AI: Normal — No Defect
+              </div>
+              <div style="color:#7ABFB3;margin-top:8px;font-size:0.9rem;line-height:1.5">
+                {verdict_reason}
+              </div>
+              <div style="margin-top:8px;font-size:0.85rem;color:#D8E0F4;">
+                AI Score: <span style="font-family:'DM Mono',monospace;color:#90D4CA;font-weight:600;">{anomaly_score:.2f}</span> (Threshold: 0.50)
+              </div>
+              <div style="margin-top:6px;font-size:0.72rem;color:#3A6A5E;letter-spacing:0.06em;text-transform:uppercase;">
+                AI Zero-Shot Inspection · {category}
+              </div>
+            </div>"""
+
+        metrics_text = (
+            f"AI Anomaly Score : {anomaly_score:.4f}\n"
+            f"AI Threshold     : 0.500000\n"
+            f"Verdict          : {'ANOMALY' if is_anomaly else 'NORMAL'}\n"
+            f"Category         : {category}\n"
+            f"Model trained    : ✗ (Fallback to LMM)"
         )
+
+        viz_html = _build_viz_panel(anomaly_score, threshold, is_anomaly, score_map, f"{category} (AI)")
+        return overlay, score_bar, verdict_html, metrics_text, viz_html
 
     pc = MODELS[category]
 
@@ -634,8 +774,8 @@ def run_inference(
         and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
     )
     if segment_enabled:
-        from model import apply_otsu_mask
-        img_pil = apply_otsu_mask(img_pil)
+        from model import apply_rembg_mask
+        img_pil = apply_rembg_mask(img_pil)
     img_tensor = TRANSFORM(img_pil).unsqueeze(0)
 
     anomaly_score, score_map = pc.predict_image(img_tensor)
@@ -723,33 +863,39 @@ def _risk_config(risk: str) -> dict:
 def run_spec_analysis(
     image: Optional[Image.Image],
     category: str,
+    custom_category: str = "",
 ) -> str:
+    if category == "Other (Specify below...)" and custom_category:
+        category = custom_category.strip()
+
     if image is None:
         return """
         <div style="font-family:'DM Sans',sans-serif;color:#E8674A;font-size:0.88rem;
             padding:14px;border:1px solid #5C2318;border-radius:6px;background:#160C0A;">
             Please upload an image first.</div>"""
 
-    if category not in MODELS:
-        return f"""
-        <div style="font-family:'DM Sans',sans-serif;color:#E8674A;font-size:0.88rem;
-            padding:14px;border:1px solid #5C2318;border-radius:6px;background:#160C0A;">
-            No trained model for <strong>{category}</strong>. Run <code>train.py</code> first.</div>"""
-
-    pc = MODELS[category]
     img_pil = image.convert("RGB")
-    segment_enabled = (
-        CFG["dataset"].get("segmentation", {}).get("enabled", False)
-        and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
-    )
-    if segment_enabled:
-        from model import apply_otsu_mask
-        img_pil = apply_otsu_mask(img_pil)
-    img_tensor = TRANSFORM(img_pil).unsqueeze(0)
-    anomaly_score, _ = pc.predict_image(img_tensor)
-    threshold  = pc.threshold
-    is_anomaly = anomaly_score >= threshold
-    verdict    = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
+    if category not in MODELS:
+        # Fallback to zero-shot
+        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+        anomaly_score = res["anomaly_score"]
+        is_anomaly = res["is_anomaly"]
+        threshold = 0.5
+        verdict = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
+    else:
+        pc = MODELS[category]
+        segment_enabled = (
+            CFG["dataset"].get("segmentation", {}).get("enabled", False)
+            and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
+        )
+        if segment_enabled:
+            from model import apply_rembg_mask
+            img_pil = apply_rembg_mask(img_pil)
+        img_tensor = TRANSFORM(img_pil).unsqueeze(0)
+        anomaly_score, _ = pc.predict_image(img_tensor)
+        threshold  = pc.threshold
+        is_anomaly = anomaly_score >= threshold
+        verdict    = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
 
     report = spec_analyzer.analyze_with_spec(img_pil, category, anomaly_score, verdict)
     risk, _ = spec_analyzer.get_risk_level(report)
@@ -834,6 +980,7 @@ def reset_spec_report() -> str:
 def generate_pdf_report(
     image: Optional[Image.Image],
     category: str,
+    custom_category: str = "",
 ) -> Optional[str]:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -845,23 +992,34 @@ def generate_pdf_report(
     )
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
-    if image is None or category not in MODELS:
+    if category == "Other (Specify below...)" and custom_category:
+        category = custom_category.strip()
+
+    if image is None:
         return None
 
-    pc = MODELS[category]
     img_pil = image.convert("RGB")
-    segment_enabled = (
-        CFG["dataset"].get("segmentation", {}).get("enabled", False)
-        and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
-    )
-    if segment_enabled:
-        from model import apply_otsu_mask
-        img_pil = apply_otsu_mask(img_pil)
-    img_tensor = TRANSFORM(img_pil).unsqueeze(0)
-    anomaly_score, _ = pc.predict_image(img_tensor)
-    threshold  = pc.threshold
-    is_anomaly = anomaly_score >= threshold
-    verdict    = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
+    if category not in MODELS:
+        # Fallback to zero-shot
+        res = spec_analyzer.analyze_zero_shot(img_pil, category)
+        anomaly_score = res["anomaly_score"]
+        is_anomaly = res["is_anomaly"]
+        threshold = 0.5
+        verdict = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
+    else:
+        pc = MODELS[category]
+        segment_enabled = (
+            CFG["dataset"].get("segmentation", {}).get("enabled", False)
+            and category in CFG["dataset"].get("segmentation", {}).get("categories", [])
+        )
+        if segment_enabled:
+            from model import apply_rembg_mask
+            img_pil = apply_rembg_mask(img_pil)
+        img_tensor = TRANSFORM(img_pil).unsqueeze(0)
+        anomaly_score, _ = pc.predict_image(img_tensor)
+        threshold  = pc.threshold
+        is_anomaly = anomaly_score >= threshold
+        verdict    = "ANOMALY (DEFECTIVE)" if is_anomaly else "NORMAL"
 
     report_text = spec_analyzer.analyze_with_spec(img_pil, category, anomaly_score, verdict)
     risk, _     = spec_analyzer.get_risk_level(report_text)
@@ -1199,9 +1357,16 @@ def build_demo() -> gr.Blocks:
                 gr.Markdown(INSTRUCTIONS_MD)
 
                 category_dd = gr.Dropdown(
-                    choices=CATEGORIES,
+                    choices=CATEGORIES + ["Other (Specify below...)"],
                     value=default_cat,
                     label="Component Category",
+                    interactive=True,
+                    allow_custom_value=True,
+                )
+                custom_category_tb = gr.Textbox(
+                    label="Custom Component Name",
+                    placeholder="e.g., resistor, diode, fuse, socket...",
+                    visible=False,
                     interactive=True,
                 )
                 input_img = gr.Image(
@@ -1299,21 +1464,35 @@ def build_demo() -> gr.Blocks:
           PATCHCORE · RESNET-50 · MVTEC-AD · GRADIO
         </div>""")
 
+        # ── Toggle textbox visibility based on choice ─────────────────
+        def toggle_custom_tb(cat_name):
+            if cat_name == "Other (Specify below...)":
+                return gr.update(visible=True)
+            return gr.update(visible=False)
+
+        category_dd.change(
+            fn=toggle_custom_tb,
+            inputs=[category_dd],
+            outputs=[custom_category_tb],
+            queue=False,
+        )
+
         # ── Event binding ─────────────────────────────────────────
         detect_btn.click(
             fn=run_inference,
-            inputs=[input_img, category_dd],
+            inputs=[input_img, category_dd, custom_category_tb],
             outputs=[heatmap_out, score_bar_out, verdict_html, metrics_box, viz_panel],
         )
         detect_btn.click(
             fn=reset_spec_report,
             inputs=[],
             outputs=[spec_report_out],
+            queue=False,
         )
 
         spec_btn.click(
             fn=run_spec_analysis,
-            inputs=[input_img, category_dd],
+            inputs=[input_img, category_dd, custom_category_tb],
             outputs=[spec_report_out],
         ).then(
             fn=lambda: gr.update(visible=True),
@@ -1323,7 +1502,7 @@ def build_demo() -> gr.Blocks:
 
         download_btn.click(
             fn=generate_pdf_report,
-            inputs=[input_img, category_dd],
+            inputs=[input_img, category_dd, custom_category_tb],
             outputs=[report_file_out],
         ).then(
             fn=lambda: gr.update(visible=True),

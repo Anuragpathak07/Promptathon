@@ -18,11 +18,15 @@ dataset:
   data_dir: "./data/mvtec"
   segmentation:
     enabled: true
-    method: "otsu"
+    method: "rembg"
     categories:
       - metal_nut
       - capsule
       - pill
+      - pcb1
+      - pcb2
+      - pcb3
+      - pcb4
 
 model:
   backbone: "resnet50"          # Feature extractor backbone
